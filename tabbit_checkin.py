@@ -29,7 +29,8 @@ macOS 下 Tabbit 的 Cookies 库**无法离线解密**（实测：格式为标�
 但 Keychain 中 "Tabbit Browser Safe Storage" 的密钥无法解出明文，说明 Tabbit 使用了
 非标准密钥来源）。因此本脚本改用 **Tabbit 自带的 Playwright 桥**读取登录态：
 
-    tabbit-cli nodejs --task <name> --request-id <id> --read-only   # 代码走 stdin
+    tabbit-cli nodejs --task <name> --request-id <id>   # 代码走 stdin
+    # （Tabbit 1.15.17 起移除 --read-only 参数；旧版才需要，脚本自动回退兼容）
 
 浏览器内 context.cookies() 返回的是已解密明文，零逆向、零依赖。读取结果会缓存到
 本地（带 JWT 过期时间），缓存有效期内不重复调用浏览器。
@@ -180,17 +181,23 @@ return out;
 def read_cookies_via_cli(cli, log: Log, timeout_ms=60000):
     """通过 Tabbit 的 Playwright 桥读取各站点解密后的 Cookie。
 
-    使用兼容模式命令：code 从 stdin 送入，stdout 回一行 JSON receipt。
+    兼容两种 CLI 版本：Tabbit 1.15.17 起 nodejs 子命令移除了 --read-only 参数
+    （传入即报 usage 错误 exit=70）；旧版本则要求 --read-only。
+    策略：先按新式调用（无 --read-only），若报 usage 错误则回退旧式重试一次。
+    code 从 stdin 送入，stdout 回一行 JSON receipt。
     只做读取，不新建标签页、不操控 UI。
     """
     task = "tabbit-checkin"
     rid = f"ck-{int(time.time())}"
     js = CLI_JS % json.dumps(sorted(set(SITES.values())))
 
-    def _call(extra):
+    def _call(read_only):
         argv = [cli, "nodejs", "--task", task, "--request-id", rid,
-                "--read-only", "--timeout-ms", str(timeout_ms)] + extra
-        log.info("调用 Tabbit Playwright 桥读取登录态……")
+                "--timeout-ms", str(timeout_ms)]
+        if read_only:
+            argv.append("--read-only")
+        log.info(f"调用 Tabbit Playwright 桥读取登录态……"
+                 f"（{'旧式' if read_only else '新式'}参数）")
         try:
             return subprocess.run(argv, input=js.encode("utf-8"),
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -198,7 +205,18 @@ def read_cookies_via_cli(cli, log: Log, timeout_ms=60000):
         except subprocess.TimeoutExpired:
             raise RuntimeError("tabbit-cli 调用超时（浏览器无响应？）")
 
-    proc = _call([])
+    def _looks_like_usage_error(proc):
+        if proc.returncode == 0:
+            return False
+        blob = (proc.stderr.decode("utf-8", "replace")
+                + proc.stdout.decode("utf-8", "replace"))
+        return "Usage:" in blob or "REQUEST_FAILED" in blob
+
+    proc = _call(read_only=False)
+    if _looks_like_usage_error(proc):
+        # 旧版 CLI 需要 --read-only；新报 usage 说明参数集不匹配，回退旧式
+        log.warn("新式调用被拒绝，回退旧式（--read-only）重试……")
+        proc = _call(read_only=True)
     receipts = [ln for ln in proc.stdout.decode("utf-8", "replace").splitlines()
                 if ln.strip().startswith("{")]
     if not receipts:
